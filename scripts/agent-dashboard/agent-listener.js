@@ -23,6 +23,7 @@ const OPENCLAW_BIN = process.env.OPENCLAW_BIN || 'openclaw';
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const CHAT_ID      = process.env.CHAT_ID;
 const ALL_AGENTS   = ['obsi', 'rise', 'lab', 'art'];
+const DEBATE_GROUP = process.env.DEBATE_GROUP || '-1003834471717';
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error('SUPABASE_URL / SUPABASE_SERVICE_KEY 환경변수 필요');
@@ -114,7 +115,7 @@ async function injectToAgent(msg) {
     const oneline = prompt.replace(/\n/g, ' ').replace(/'/g, '');
     const result = execSync(
       `${OPENCLAW_BIN} agent --agent main --timeout 30000 --message '${oneline}'`,
-      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }
     ).trim();
 
     console.log(`[${MY_AGENT} 응답] ${result.slice(0, 200)}`);
@@ -163,8 +164,12 @@ async function handleInsert(payload) {
 
   console.log(`[${msg.type}] from ${msg.from_agent}: ${msg.subject || ''}`);
   
-  // 1. 텔레그램 알림 (빠르게)
-  await sendTelegram(formatMessage(msg));
+  // 1. 알림 (debate는 그룹으로, 그 외는 개인챗)
+  if (msg.type === 'debate_turn' || msg.type === 'debate') {
+    // debate는 그룹에서만
+  } else {
+    await sendTelegram(formatMessage(msg));
+  }
   await markAsRead(msg.id);
   
   // 2. 에이전트에 주입 → 응답 받기 → DB 기록
@@ -181,10 +186,15 @@ async function handleInsert(payload) {
 
 // ── Debate Turn Handler ──────────────────────────────────────
 async function handleDebateTurn(msg) {
-  const meta = msg.metadata || {};
+  const meta = msg.context || {};
   const debateId = meta.debate_id;
   const round = meta.round || 1;
   const maxRounds = meta.max_rounds || 3;
+
+  // 중복 방지: 자기 응답이 이미 있으면 skip
+  if (msg.responses && msg.responses[MY_AGENT]) return;
+  const { data: freshMsg } = await supabase.from('agent_messages').select('status,responses').eq('id', msg.id).single();
+  if (freshMsg?.responses && freshMsg.responses[MY_AGENT]) return;
 
   console.log(`[DEBATE_TURN R${round}] ${msg.subject} — ${MY_AGENT} 응답 중...`);
 
@@ -214,7 +224,9 @@ async function handleDebateTurn(msg) {
   try {
     const result = execSync(
       `${OPENCLAW_BIN} agent --agent main --timeout 30000 --message '${oneline}'`,
-      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ''}` }
+      }
     ).trim();
 
     console.log(`[DEBATE_TURN R${round}] ${MY_AGENT}: ${result.slice(0, 150)}`);
@@ -250,7 +262,7 @@ async function handleDebateTurn(msg) {
             subject: `[토론 Round ${round + 1}] ${data?.subject || ''}`,
             body: `토론을 계속합니다. 이전 의견을 참고하여 ${round + 1 === maxRounds ? '최종 합의안' : '반론 또는 보충'}을 제시해주세요.`,
             status: 'pending',
-            metadata: { debate_id: debateId, round: round + 1, max_rounds: maxRounds }
+            context: { debate_id: debateId, round: round + 1, max_rounds: maxRounds }
           });
         }
       } else if (allAnswered && round >= maxRounds) {
@@ -260,9 +272,32 @@ async function handleDebateTurn(msg) {
       await supabase.from('agent_messages').update(update).eq('id', debateId);
     }
 
-    await sendTelegram(`🗣️ <b>[DEBATE R${round}] ${MY_AGENT}</b>\n${result.slice(0, 2000)}`);
+    await sendToGroup(`🗣️ <b>[Round ${round}] ${MY_AGENT}</b>\n${result.slice(0, 2000)}`);
   } catch (err) {
     console.error(`DEBATE_TURN 응답 실패: ${err.message}`);
+  }
+}
+
+// ── 그룹챗으로 토론 응답 ──────────────────────────────────
+async function sendToGroup(text) {
+  if (!BOT_TOKEN) return;
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: DEBATE_GROUP,
+          text: text.slice(0, 4000),
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }),
+      }
+    );
+    if (!res.ok) console.error(`Group send HTTP ${res.status}`);
+  } catch (err) {
+    console.error('Group 전송 실패:', err.message);
   }
 }
 
@@ -304,7 +339,7 @@ async function handleDebateUpdate(payload) {
   try {
     const result = execSync(
       `${OPENCLAW_BIN} agent --agent main --timeout 30000 --message '${oneline}'`,
-      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }
     ).trim();
 
     // debate_rounds 업데이트
@@ -325,7 +360,7 @@ async function handleDebateUpdate(payload) {
 
     await supabase.from('agent_messages').update(update).eq('id', msg.id);
     console.log(`[DEBATE R${round}] ${MY_AGENT} 응답 완료: ${result.slice(0, 100)}`);
-    await sendTelegram(`🗣️ <b>[DEBATE R${round}] ${MY_AGENT}</b>\n${result.slice(0, 2000)}`);
+    await sendToGroup(`🗣️ <b>[DEBATE R${round}] ${MY_AGENT}</b>\n${result.slice(0, 2000)}`);
   } catch (err) {
     console.error(`DEBATE 응답 실패: ${err.message}`);
   }
