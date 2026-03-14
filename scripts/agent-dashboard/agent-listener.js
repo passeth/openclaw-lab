@@ -114,8 +114,8 @@ async function injectToAgent(msg) {
     // 줄바꿈을 공백으로 치환해서 한 줄로
     const oneline = prompt.replace(/\n/g, ' ').replace(/'/g, '');
     const result = execSync(
-      `${OPENCLAW_BIN} agent --agent main --timeout 30000 --message '${oneline}'`,
-      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }
+      `${OPENCLAW_BIN} agent --agent main --timeout 60000 --message '${oneline}'`,
+      { timeout: 120000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }
     ).trim();
 
     console.log(`[${MY_AGENT} 응답] ${result.slice(0, 200)}`);
@@ -223,8 +223,8 @@ async function handleDebateTurn(msg) {
   const oneline = prompt.replace(/\n/g, ' ').replace(/'/g, '');
   try {
     const result = execSync(
-      `${OPENCLAW_BIN} agent --agent main --timeout 30000 --message '${oneline}'`,
-      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
+      `${OPENCLAW_BIN} agent --agent main --timeout 60000 --message '${oneline}'`,
+      { timeout: 120000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
         env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ''}` }
       }
     ).trim();
@@ -234,8 +234,11 @@ async function handleDebateTurn(msg) {
     // debate_turn 메시지를 completed로
     await supabase.from('agent_messages').update({ status: 'completed', responses: { [MY_AGENT]: result.slice(0, 500) } }).eq('id', msg.id);
 
-    // 메인 debate 메시지의 debate_rounds 업데이트
+    // 메인 debate 메시지의 debate_rounds 업데이트 (retry로 race condition 방지)
     if (debateId) {
+      // 500ms 딜레이 (봇마다 약간 다른 타이밍)
+      await new Promise(r => setTimeout(r, Math.random() * 2000 + 500));
+      
       const { data } = await supabase.from('agent_messages').select('debate_rounds, debate_config, to_agents').eq('id', debateId).single();
       const rounds = data?.debate_rounds || {};
       const cfg = data?.debate_config || {};
@@ -275,6 +278,11 @@ async function handleDebateTurn(msg) {
     await sendToGroup(`🗣️ <b>[Round ${round}] ${MY_AGENT}</b>\n${result.slice(0, 2000)}`);
   } catch (err) {
     console.error(`DEBATE_TURN 응답 실패: ${err.message}`);
+    // 실패해도 에러 기록
+    await supabase.from('agent_messages').update({ 
+      status: 'completed', 
+      responses: { [MY_AGENT]: `⚠️ 응답 실패: ${err.message.slice(0, 100)}` } 
+    }).eq('id', msg.id);
   }
 }
 
@@ -302,9 +310,9 @@ async function sendToGroup(text) {
 }
 
 async function handleDebateUpdate(payload) {
-  const msg = payload.new;
-  if (msg.type !== 'debate') return;
-  if (!msg.to_agents.includes(MY_AGENT) && !msg.to_agents.includes('all')) return;
+  // debate_turn 방식으로 전환 — UPDATE 핸들러는 비활성화
+  // (debate_turn INSERT가 각 에이전트에게 개별 전달)
+  return;
 
   const cfg   = msg.debate_config || {};
   const round = cfg.current_round || 1;
@@ -338,8 +346,8 @@ async function handleDebateUpdate(payload) {
   const oneline = prompt.replace(/\n/g, ' ').replace(/'/g, '');
   try {
     const result = execSync(
-      `${OPENCLAW_BIN} agent --agent main --timeout 30000 --message '${oneline}'`,
-      { timeout: 60000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }
+      `${OPENCLAW_BIN} agent --agent main --timeout 60000 --message '${oneline}'`,
+      { timeout: 120000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }
     ).trim();
 
     // debate_rounds 업데이트
