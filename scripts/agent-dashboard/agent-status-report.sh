@@ -258,11 +258,114 @@ main() {
 
     # Supabase 업데이트
     if ! update_agent_status "$gateway_status" "$cpu_percent" "$memory_mb" "$disk_free_gb" "$active_sessions" "$active_crons" "$last_activity" "$gateway_version" "$openclaw_version"; then
-        # 업데이트 실패 시에도 계속 진행 (cron은 계속 실행)
         log_error "Supabase update failed, continuing..."
     fi
 
+    # ── Profile + Cron 수집 (통합) ──
+    update_profile_and_crons
+
     log "Status report completed"
+}
+
+# ============ PROFILE + CRON 수집 ============
+update_profile_and_crons() {
+    local WS="${HOME}/.openclaw/workspace"
+    local TODAY=$(date +%Y-%m-%d)
+    local OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
+
+    # Python 스크립트로 한 번에 처리 (JSON 생성이 bash로는 힘듦)
+    python3 - "$WS" "$TODAY" "$AGENT_ID" "$SUPABASE_URL" "$SUPABASE_SERVICE_KEY" "$OPENCLAW_BIN" << 'PYEOF'
+import sys, json, os, subprocess, urllib.request
+from datetime import datetime, timezone
+
+WS, TODAY, AGENT_ID, SB_URL, SK, OC_BIN = sys.argv[1:7]
+
+def read_file(path, max_chars=3000):
+    try:
+        with open(path) as f: return f.read()[:max_chars]
+    except: return ""
+
+def api_patch(table, filter_col, filter_val, data):
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(
+        f"{SB_URL}/rest/v1/{table}?{filter_col}=eq.{filter_val}",
+        data=body, method="PATCH",
+        headers={"apikey": SK, "Authorization": f"Bearer {SK}", "Content-Type": "application/json"}
+    )
+    try: urllib.request.urlopen(req); return True
+    except: return False
+
+def api_delete(table, filter_col, filter_val):
+    req = urllib.request.Request(
+        f"{SB_URL}/rest/v1/{table}?{filter_col}=eq.{filter_val}",
+        method="DELETE", headers={"apikey": SK, "Authorization": f"Bearer {SK}"}
+    )
+    try: urllib.request.urlopen(req)
+    except: pass
+
+def api_insert(table, rows):
+    body = json.dumps(rows).encode()
+    req = urllib.request.Request(
+        f"{SB_URL}/rest/v1/{table}",
+        data=body, method="POST",
+        headers={"apikey": SK, "Authorization": f"Bearer {SK}", "Content-Type": "application/json"}
+    )
+    try: urllib.request.urlopen(req); return True
+    except Exception as e: print(f"  INSERT err: {e}", file=sys.stderr); return False
+
+# ── 1. Profile → agent_status.tasks ──
+soul = read_file(f"{WS}/SOUL.md")
+identity = read_file(f"{WS}/IDENTITY.md")
+memory = read_file(f"{WS}/memory/{TODAY}.md")
+
+sessions_json = "[]"
+try:
+    r = subprocess.run([OC_BIN, "sessions", "list", "--json", "--limit", "10"],
+        capture_output=True, text=True, timeout=10)
+    if r.returncode == 0: sessions_json = r.stdout[:2000]
+except: pass
+
+tasks = {"soul_md": soul, "identity_md": identity, "today_memory": memory, "recent_sessions": sessions_json}
+if api_patch("agent_status", "agent_id", AGENT_ID, {"tasks": tasks}):
+    print(f"  profile: soul={len(soul)} id={len(identity)} mem={len(memory)}")
+
+# ── 2. Crons → agent_crons ──
+KEYS = ["id","agent_id","label","schedule","timezone","enabled","next_run_at","last_run_at","last_run_status","last_run_duration_sec","total_runs","success_count"]
+
+try:
+    r = subprocess.run([OC_BIN, "cron", "list", "--json"], capture_output=True, text=True, timeout=10)
+    data = json.loads(r.stdout)
+    jobs = data.get("jobs", []) if isinstance(data, dict) else data
+
+    crons = []
+    for j in jobs:
+        s, st = j.get("schedule", {}), j.get("state", {})
+        expr = s.get("expr", "")
+        if not expr and s.get("everyMs"): expr = f"every {s['everyMs']//60000}m"
+
+        c = {
+            "id": j["id"], "agent_id": AGENT_ID, "label": j.get("name", "?"),
+            "schedule": expr or "?", "timezone": s.get("tz", "Asia/Seoul"), "enabled": j.get("enabled", True),
+            "next_run_at": datetime.fromtimestamp(st["nextRunAtMs"]/1000, tz=timezone.utc).isoformat() if st.get("nextRunAtMs") else None,
+            "last_run_at": datetime.fromtimestamp(st["lastRunAtMs"]/1000, tz=timezone.utc).isoformat() if st.get("lastRunAtMs") else None,
+            "last_run_status": st.get("lastRunStatus") or st.get("lastStatus"),
+            "last_run_duration_sec": int(st["lastDurationMs"]/1000) if st.get("lastDurationMs") else None,
+            "total_runs": st.get("totalRuns") or 0, "success_count": st.get("successCount") or 0,
+        }
+        # 키 정규화
+        row = {}
+        for k in KEYS:
+            row[k] = c.get(k)
+            if row[k] is None and k in ("total_runs","success_count"): row[k] = 0
+            if row[k] is None and k == "enabled": row[k] = True
+        crons.append(row)
+
+    api_delete("agent_crons", "agent_id", AGENT_ID)
+    if crons and api_insert("agent_crons", crons):
+        print(f"  crons: {len(crons)} synced")
+except Exception as e:
+    print(f"  crons err: {e}", file=sys.stderr)
+PYEOF
 }
 
 # 에러 트랩
