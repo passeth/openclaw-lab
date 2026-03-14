@@ -1,0 +1,13 @@
+node_modules/
+__pycache__/
+*.pyc
+.venv*/
+_archive/
+*_dump/
+*.log
+.DS_Store
+.env
+*.pkl
+*.pickle
+cache_*.json
+engine_b_*.json
